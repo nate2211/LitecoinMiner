@@ -1,0 +1,18 @@
+{
+  "host": "scrypt.na.mine.zpool.ca",
+  "port": 3433,
+  "login": "ltc1q2v7z36dqp696l4p44a4cynmcym8lj80awpe3rr",
+  "password": "x",
+  "native_dll_path": "LitecoinProject.dll",
+  "scan_backend": "opencl",
+  "scan_window_nonces": 60960,
+  "idle_sleep_s": 0.05,
+  "log_hashrate_interval_s": 30.0,
+  "platform_index": 0,
+  "device_index": 0,
+  "kernel_path": "litecoin_scrypt_scan.cl",
+  "opencl_kernel_name": "ltc_scrypt_scan",
+  "local_work_size": 128,
+  "build_options": "-cl-std=CL1.2",
+  "max_results_per_scan": 32
+}
