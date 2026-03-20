@@ -34,7 +34,7 @@ binaries += add_binary("OpenCL.dll")
 
 hiddenimports = [
     "gui",
-    "litecoin_modeles",   # keep this if your file is really named litecoin_modeles.py
+    "litecoin_models",   # keep this if your file is really named litecoin_modeles.py
     "litecoin_native",
     "litecoin_opencl",
     "litecoin_pool",
