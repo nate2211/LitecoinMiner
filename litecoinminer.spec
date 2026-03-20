@@ -1,41 +1,55 @@
-# -*- mode: python ; coding: utf-8 -*-
+# litecoinminer.spec
+# Build with:
+#   pyinstaller --clean --noconfirm litecoinminer.spec
 
+import os
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
-# IMPORTANT:
-# Run: pyinstaller --clean bitcoinminer.spec
-# from the BitcoinMiner project folder.
-ROOT = Path.cwd()
+ROOT = Path(globals().get("SPECPATH", os.getcwd())).resolve()
+
+def add_data(filename, dest="."):
+    p = ROOT / filename
+    if p.exists():
+        return [(str(p), dest)]
+    print(f"[spec] warning: missing data file: {p}")
+    return []
+
+def add_binary(filename, dest="."):
+    p = ROOT / filename
+    if p.exists():
+        return [(str(p), dest)]
+    print(f"[spec] warning: missing binary file: {p}")
+    return []
 
 datas = []
+datas += add_data("litecoin_miner_config.json")
+datas += add_data("litecoin_scrypt_scan.cl")
+
 binaries = []
-hiddenimports = []
+binaries += add_binary("LitecoinProject.dll")
+binaries += add_binary("OpenCL.dll")
 
-kernel_path = ROOT / "btc_sha256d_scan.cl"
-if kernel_path.exists():
-    datas.append((str(kernel_path), "."))
+hiddenimports = [
+    "gui",
+    "litecoin_modeles",   # keep this if your file is really named litecoin_modeles.py
+    "litecoin_native",
+    "litecoin_opencl",
+    "litecoin_pool",
+    "litecoin_utils",
+    "litecoin_worker",
+]
 
-config_path = ROOT / "bitcoin_gui_config.json"
-if config_path.exists():
-    datas.append((str(config_path), "."))
+# If the real filename is litecoin_models.py instead, replace the line above with:
+# "litecoin_models",
 
-for dll_name in ("BitcoinProject.dll", "OpenCL.dll"):
-    dll_path = ROOT / dll_name
-    if dll_path.exists():
-        binaries.append((str(dll_path), "."))
-
-hiddenimports += collect_submodules("pyopencl")
-hiddenimports += collect_submodules("numpy")
+# Helps PyInstaller catch PyQt5 pieces if your GUI imports are dynamic.
 hiddenimports += collect_submodules("PyQt5")
 
-binaries += collect_dynamic_libs("pyopencl")
-binaries += collect_dynamic_libs("numpy")
-
 a = Analysis(
-    ["gui.py"],
+    ["main.py"],
     pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,
@@ -47,7 +61,7 @@ a = Analysis(
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
@@ -55,14 +69,14 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="BitcoinMiner",
+    name="LitecoinMiner",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=False,   # change to True if you want a console window
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
