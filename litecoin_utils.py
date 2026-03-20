@@ -131,6 +131,14 @@ def _swap_prevhash_words(prevhash_hex: str) -> bytes:
     return b"".join(raw[i:i + 4][::-1] for i in range(0, 32, 4))
 
 
+def _u32_hex_to_le(text: str) -> bytes:
+    raw = hex_to_bytes(text)
+    if len(raw) != 4:
+        raise ValueError("expected exactly 4 bytes")
+    value = int.from_bytes(raw, "big", signed=False)
+    return value.to_bytes(4, "little", signed=False)
+
+
 def build_header76(
     version_hex: str,
     prevhash_hex: str,
@@ -138,22 +146,16 @@ def build_header76(
     ntime_hex: str,
     nbits_hex: str,
 ) -> bytes:
-    version = hex_to_bytes(version_hex)
+    version = _u32_hex_to_le(version_hex)
     prevhash = _swap_prevhash_words(prevhash_hex)
-    merkle = bytes(merkle_root)
-    ntime = hex_to_bytes(ntime_hex)
-    nbits = hex_to_bytes(nbits_hex)
+    merkle = bytes(merkle_root)  # keep raw digest bytes unless your native test proves otherwise
+    ntime = _u32_hex_to_le(ntime_hex)
+    nbits = _u32_hex_to_le(nbits_hex)
 
-    if len(version) != 4:
-        raise ValueError("version_hex must decode to 4 bytes")
     if len(prevhash) != 32:
         raise ValueError("prevhash must decode to 32 bytes")
     if len(merkle) != 32:
         raise ValueError("merkle_root must be exactly 32 bytes")
-    if len(ntime) != 4:
-        raise ValueError("ntime_hex must decode to 4 bytes")
-    if len(nbits) != 4:
-        raise ValueError("nbits_hex must decode to 4 bytes")
 
     out = version + prevhash + merkle + ntime + nbits
     if len(out) != 76:

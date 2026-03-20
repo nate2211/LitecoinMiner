@@ -78,6 +78,9 @@ class LitecoinMinerConfig:
     build_options: str = "-cl-std=CL1.2"
     max_results_per_scan: int = 32
 
+    # New: only affects OpenCL backend
+    verify_opencl_hits_on_cpu: bool = True
+
     @property
     def uses_opencl(self) -> bool:
         return self.scan_backend == "opencl"
@@ -120,6 +123,11 @@ class LitecoinMinerConfig:
         cfg.local_work_size = max(1, _coerce_int(cfg.local_work_size, 128))
         cfg.build_options = str(cfg.build_options or "-cl-std=CL1.2").strip() or "-cl-std=CL1.2"
         cfg.max_results_per_scan = max(1, _coerce_int(cfg.max_results_per_scan, 32))
+
+        cfg.verify_opencl_hits_on_cpu = _coerce_bool(
+            getattr(cfg, "verify_opencl_hits_on_cpu", True),
+            True,
+        )
 
         return cfg
 

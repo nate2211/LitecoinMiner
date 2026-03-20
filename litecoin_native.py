@@ -121,6 +121,7 @@ class LitecoinNativeBridge:
                     f"[native] loaded {self.dll_path} "
                     f"(scrypt_hash=yes, scrypt_scan=yes, hash_meets_target=yes)"
                 )
+                self.self_test()
             else:
                 missing = []
                 if self._fn_scrypt_hash is None:
@@ -137,6 +138,28 @@ class LitecoinNativeBridge:
             self.load_error = str(exc)
             self.on_log(f"[native] unavailable: {exc}")
 
+    def self_test(self) -> None:
+        header_hex = (
+            "01000000"
+            "f615f7ce3b4fc6b8f61e8f89aedb1d0852507650533a9e3b10b9bbcc30639f27"
+            "9fcaa86746e1ef52d3edb3c4ad8259920d509bd073605c9bf1d59983752a6b06"
+            "b817bb4e"
+            "a78e011d"
+            "012d59d4"
+        )
+        expected_hash_be = "0000000110c8357966576df46f3b802ca897deb7ad18b12f1c24ecff6386ebd9"
+
+        got_le = self.scrypt_hash(bytes.fromhex(header_hex))
+        got_be = got_le[::-1].hex()
+
+        if got_be != expected_hash_be:
+            raise RuntimeError(
+                f"Litecoin self-test failed:\n"
+                f"expected={expected_hash_be}\n"
+                f"got     ={got_be}"
+            )
+        else:
+            self.on_log(f"[native] expected hash result on self test")
     def _prepare_dll_search_dirs(self, dll_path: str) -> None:
         if os.name != "nt":
             return
@@ -319,6 +342,7 @@ class NativeLitecoinScanner:
     def initialize(self) -> None:
         if self.native is None or not self.native.available:
             raise RuntimeError("Native scanner requires LitecoinProject.dll")
+
 
     def scan(
         self,

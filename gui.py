@@ -16,20 +16,116 @@ from litecoin_opencl import OpenCLLitecoinScanner
 from litecoin_worker import LitecoinMinerWorker
 
 
-CONFIG_PATH = Path("litecoin_miner_config.json")
+CONFIG_FILENAME = "litecoin_miner_config.json"
+
+
+def _module_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _exe_dir() -> Path:
+    return Path(sys.executable).resolve().parent
+
+
+def _cwd_dir() -> Path:
+    return Path.cwd().resolve()
+
+
+def _meipass_dir() -> Optional[Path]:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return None
+    try:
+        return Path(meipass).resolve()
+    except Exception:
+        return None
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
+def _config_load_candidates() -> list[Path]:
+    paths: list[Path] = [
+        _exe_dir() / CONFIG_FILENAME,
+        _cwd_dir() / CONFIG_FILENAME,
+        _module_dir() / CONFIG_FILENAME,
+    ]
+    meipass = _meipass_dir()
+    if meipass is not None:
+        paths.append(meipass / CONFIG_FILENAME)
+    return _unique_paths(paths)
+
+
+def _config_save_candidates() -> list[Path]:
+    paths: list[Path] = [
+        _exe_dir() / CONFIG_FILENAME,
+        _cwd_dir() / CONFIG_FILENAME,
+        _module_dir() / CONFIG_FILENAME,
+    ]
+    meipass = _meipass_dir()
+    if meipass is not None:
+        paths.append(meipass / CONFIG_FILENAME)
+    return _unique_paths(paths)
+
+
+def _is_writable_target(path: Path) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        test_file = path.parent / ".litecoin_cfg_write_test"
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_load_config_path() -> Optional[Path]:
+    for candidate in _config_load_candidates():
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_save_config_path() -> Path:
+    for candidate in _config_save_candidates():
+        if _is_writable_target(candidate):
+            return candidate
+    return _cwd_dir() / CONFIG_FILENAME
+
+
+CONFIG_PATH = _resolve_save_config_path()
 
 
 def load_config() -> LitecoinMinerConfig:
-    if CONFIG_PATH.exists():
+    global CONFIG_PATH
+
+    for candidate in _config_load_candidates():
+        if not candidate.exists():
+            continue
         try:
-            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+            CONFIG_PATH = candidate
             return LitecoinMinerConfig.from_mapping(raw)
         except Exception:
             pass
+
+    CONFIG_PATH = _resolve_save_config_path()
     return LitecoinMinerConfig()
 
 
 def save_config(cfg: LitecoinMinerConfig) -> None:
+    global CONFIG_PATH
+
+    CONFIG_PATH = _resolve_save_config_path()
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(asdict(cfg), indent=2), encoding="utf-8")
 
 
@@ -122,7 +218,6 @@ class MiningGui(QtWidgets.QMainWindow):
         self.uptime_timer.timeout.connect(self._tick_uptime)
         self.uptime_timer.start()
 
-    # ---------- UI ----------
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -347,6 +442,13 @@ class MiningGui(QtWidgets.QMainWindow):
         self.max_results_spin = QtWidgets.QSpinBox()
         self.max_results_spin.setRange(1, 10000)
 
+        self.verify_opencl_hits_check = QtWidgets.QCheckBox(
+            "Verify OpenCL GPU hits on CPU/native before submit"
+        )
+        self.verify_opencl_hits_check.setToolTip(
+            "When enabled, only OpenCL/GPU hits are rehashed on CPU/native before submit."
+        )
+
         self.browse_dll_btn = QtWidgets.QPushButton("Browse DLL")
         self.browse_dll_btn.clicked.connect(self._browse_dll)
 
@@ -358,6 +460,7 @@ class MiningGui(QtWidgets.QMainWindow):
         form.addRow("Backend", self.backend_combo)
         form.addRow("Scan Window", self.scan_window_spin)
         form.addRow("Max Results / Scan", self.max_results_spin)
+        form.addRow("", self.verify_opencl_hits_check)
 
         return box
 
@@ -525,7 +628,6 @@ class MiningGui(QtWidgets.QMainWindow):
             """
         )
 
-    # ---------- config ----------
     def _load_config_into_form(self) -> None:
         cfg = self.cfg
         self.host_edit.setText(cfg.host)
@@ -539,6 +641,7 @@ class MiningGui(QtWidgets.QMainWindow):
         self.backend_combo.setCurrentText(cfg.scan_backend)
         self.scan_window_spin.setValue(int(cfg.scan_window_nonces))
         self.max_results_spin.setValue(int(cfg.max_results_per_scan))
+        self.verify_opencl_hits_check.setChecked(bool(cfg.verify_opencl_hits_on_cpu))
 
         self.kernel_path_edit.setText(cfg.kernel_path)
         self.kernel_name_edit.setText(cfg.opencl_kernel_name)
@@ -566,6 +669,7 @@ class MiningGui(QtWidgets.QMainWindow):
             "scan_backend": self.backend_combo.currentText().strip().lower(),
             "scan_window_nonces": int(self.scan_window_spin.value()),
             "max_results_per_scan": int(self.max_results_spin.value()),
+            "verify_opencl_hits_on_cpu": bool(self.verify_opencl_hits_check.isChecked()),
             "platform_index": max(0, int(self.platform_combo.currentData() or 0)),
             "device_index": max(0, int(self.device_combo.currentData() or 0)),
             "kernel_path": self.kernel_path_edit.text().strip(),
@@ -585,7 +689,7 @@ class MiningGui(QtWidgets.QMainWindow):
         try:
             self.cfg = self._read_form_into_config()
             save_config(self.cfg)
-            self._append_log("[gui] config saved")
+            self._append_log(f"[gui] config saved to {CONFIG_PATH}")
         except Exception as exc:
             self._append_log(f"[gui] failed to save config: {exc}")
 
@@ -593,9 +697,8 @@ class MiningGui(QtWidgets.QMainWindow):
         self.cfg = load_config()
         self._load_config_into_form()
         self._refresh_devices()
-        self._append_log("[gui] config reloaded")
+        self._append_log(f"[gui] config reloaded from {CONFIG_PATH}")
 
-    # ---------- device handling ----------
     def _refresh_devices(self) -> None:
         current_platform = self.platform_combo.currentData()
         current_device = self.device_combo.currentData()
@@ -663,12 +766,13 @@ class MiningGui(QtWidgets.QMainWindow):
     def _backend_changed(self, backend: str) -> None:
         use_opencl = str(backend).strip().lower() == "opencl"
         self.opencl_group.setEnabled(use_opencl)
+        self.verify_opencl_hits_check.setEnabled(use_opencl)
 
     def _browse_dll(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select Native DLL",
-            self.native_dll_edit.text().strip() or str(Path.cwd()),
+            self.native_dll_edit.text().strip() or str(_exe_dir()),
             "DLL Files (*.dll);;All Files (*)",
         )
         if path:
@@ -678,13 +782,12 @@ class MiningGui(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select OpenCL Kernel",
-            self.kernel_path_edit.text().strip() or str(Path.cwd()),
+            self.kernel_path_edit.text().strip() or str(_exe_dir()),
             "OpenCL Files (*.cl);;All Files (*)",
         )
         if path:
             self.kernel_path_edit.setText(path)
 
-    # ---------- worker ----------
     def start_mining(self) -> None:
         if self.worker_thread is not None and self.worker_thread.isRunning():
             return
@@ -754,7 +857,6 @@ class MiningGui(QtWidgets.QMainWindow):
         self._set_status(status)
         self._append_log(f"[status] {status}")
 
-    # ---------- log parsing ----------
     def _handle_log(self, msg: str) -> None:
         self._append_log(msg)
         self._parse_log_for_stats(msg)
@@ -830,8 +932,18 @@ class MiningGui(QtWidgets.QMainWindow):
             scanner = text.split("=", 1)[1].strip()
             self.last_backend_label.setText(scanner)
 
+        if text.startswith("[worker] opencl_cpu_verify="):
+            mode = text.split("=", 1)[1].strip()
+            self.last_target_label.setText(f"cpu verify {mode}")
+
         if "[share] block-candidate" in text:
             self.last_target_label.setText("block candidate found")
+
+        if text.startswith("[verify] warning"):
+            self.last_target_label.setText("gpu/cpu hash mismatch; cpu used")
+
+        if "reason=cpu_hash_above_share_target" in text:
+            self.last_target_label.setText("gpu hit dropped by cpu verify")
 
     def _tick_uptime(self) -> None:
         if self.started_at is None:

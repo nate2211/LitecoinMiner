@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Callable, Optional
 
-from litecoin_models import LitecoinJob, LitecoinMinerConfig, LitecoinPreparedWork
+from litecoin_models import LitecoinCandidateShare, LitecoinJob, LitecoinMinerConfig, LitecoinPreparedWork
 from litecoin_native import LitecoinNativeBridge, NativeLitecoinScanner
 from litecoin_pool import LitecoinStratumClient
 from litecoin_utils import (
@@ -32,7 +32,15 @@ class LitecoinMinerWorker:
     def stop(self) -> None:
         self._stop = True
 
-    def _create_scanner(self, native: LitecoinNativeBridge):
+    def _need_native_bridge(self) -> bool:
+        backend = str(self.config.scan_backend or "native").strip().lower()
+        if backend == "native":
+            return True
+        if backend == "opencl" and bool(self.config.verify_opencl_hits_on_cpu):
+            return True
+        return False
+
+    def _create_scanner(self, native: Optional[LitecoinNativeBridge]):
         backend = str(self.config.scan_backend or "native").strip().lower()
         if backend == "opencl":
             from litecoin_opencl import OpenCLLitecoinScanner
@@ -100,6 +108,56 @@ class LitecoinMinerWorker:
         while not self._stop and time.monotonic() < end_at:
             time.sleep(min(0.1, max(0.0, end_at - time.monotonic())))
 
+    def _verify_opencl_candidate(
+        self,
+        native: Optional[LitecoinNativeBridge],
+        prepared: LitecoinPreparedWork,
+        candidate: LitecoinCandidateShare,
+    ) -> Optional[LitecoinCandidateShare]:
+        if native is None or not native.available:
+            raise RuntimeError("OpenCL CPU verification is enabled but native bridge is unavailable")
+
+        try:
+            nonce = int(str(candidate.nonce_hex).strip(), 16) & 0xFFFFFFFF
+        except Exception as exc:
+            self.on_log(
+                f"[verify] dropped gpu hit nonce={candidate.nonce_hex!r} "
+                f"reason=invalid_nonce error={exc}"
+            )
+            return None
+
+        header80 = prepared.header76 + nonce.to_bytes(4, "little", signed=False)
+        exact_hash_le = native.scrypt_hash(header80)
+        exact_hash_hex = exact_hash_le[::-1].hex()
+
+        gpu_hash_hex = str(candidate.hash_hex or "").strip().lower()
+
+        if not native.hash_meets_target(exact_hash_le, prepared.share_target32_le):
+            self.on_log(
+                f"[verify] dropped gpu hit nonce={candidate.nonce_hex} "
+                f"gpu_hash=0x{gpu_hash_hex or 'unknown'} "
+                f"cpu_hash=0x{exact_hash_hex} "
+                f"reason=cpu_hash_above_share_target"
+            )
+            return None
+
+        if gpu_hash_hex and gpu_hash_hex != exact_hash_hex:
+            self.on_log(
+                f"[verify] warning nonce={candidate.nonce_hex} "
+                f"gpu_hash=0x{gpu_hash_hex} "
+                f"cpu_hash=0x{exact_hash_hex} "
+                f"note=using_cpu_hash"
+            )
+
+        return LitecoinCandidateShare(
+            job_id=candidate.job_id,
+            extranonce2_hex=candidate.extranonce2_hex,
+            ntime_hex=candidate.ntime_hex,
+            nonce_hex=f"{nonce:08x}",
+            hash_hex=exact_hash_hex,
+            backend="opencl",
+        )
+
     def run(self) -> None:
         reconnect_delay = max(0.1, float(self.config.reconnect_delay_s))
 
@@ -111,13 +169,21 @@ class LitecoinMinerWorker:
             try:
                 self.on_status("starting")
 
-                native = LitecoinNativeBridge(self.config.native_dll_path, on_log=self.on_log)
-                if not native.available:
-                    raise RuntimeError(native.load_error or "native bridge unavailable")
+                if self._need_native_bridge():
+                    native = LitecoinNativeBridge(self.config.native_dll_path, on_log=self.on_log)
+                    if not native.available:
+                        raise RuntimeError(native.load_error or "native bridge unavailable")
+                else:
+                    self.on_log("[worker] native bridge not required for current configuration")
 
                 scanner = self._create_scanner(native)
                 scanner.initialize()
                 self.on_log(f"[worker] scanner={scanner.name}")
+
+                if scanner.name == "opencl":
+                    self.on_log(
+                        f"[worker] opencl_cpu_verify={'on' if self.config.verify_opencl_hits_on_cpu else 'off'}"
+                    )
 
                 pool = LitecoinStratumClient(self.config, on_log=self.on_log)
 
@@ -214,27 +280,48 @@ class LitecoinMinerWorker:
                         if not pool.alive:
                             raise ConnectionError(pool.reader_error or "pool reader stopped")
 
+                        authoritative = candidate
+
+                        if scanner.name == "opencl" and self.config.verify_opencl_hits_on_cpu:
+                            verified = self._verify_opencl_candidate(native, prepared, candidate)
+                            if verified is None:
+                                continue
+                            authoritative = verified
+
+                        latest = pool.get_latest_job()
+                        if latest is not None:
+                            if (
+                                str(latest.job_id) != str(authoritative.job_id)
+                                or str(latest.ntime_hex).lower() != str(authoritative.ntime_hex).lower()
+                            ):
+                                self.on_log(
+                                    f"[submit] dropping stale candidate nonce={authoritative.nonce_hex} "
+                                    f"candidate_job={authoritative.job_id} latest_job={latest.job_id} "
+                                    f"candidate_ntime={authoritative.ntime_hex} latest_ntime={latest.ntime_hex}"
+                                )
+                                continue
+
                         self.on_log(
-                            f"[share] found job={candidate.job_id} nonce={candidate.nonce_hex} "
-                            f"hash=0x{candidate.hash_hex} backend={candidate.backend}"
+                            f"[share] found job={authoritative.job_id} nonce={authoritative.nonce_hex} "
+                            f"hash=0x{authoritative.hash_hex} backend={authoritative.backend}"
                         )
 
-                        hash_le = bytes.fromhex(candidate.hash_hex)[::-1]
+                        hash_le = bytes.fromhex(authoritative.hash_hex)[::-1]
                         if int.from_bytes(hash_le, "little", signed=False) <= prepared.network_target_int:
-                            self.on_log(f"[share] block-candidate nonce={candidate.nonce_hex}")
+                            self.on_log(f"[share] block-candidate nonce={authoritative.nonce_hex}")
 
                         submit = pool.submit_share(
-                            job_id=candidate.job_id,
-                            extranonce2_hex=candidate.extranonce2_hex,
-                            ntime_hex=candidate.ntime_hex,
-                            nonce_hex=candidate.nonce_hex,
+                            job_id=authoritative.job_id,
+                            extranonce2_hex=authoritative.extranonce2_hex,
+                            ntime_hex=authoritative.ntime_hex,
+                            nonce_hex=authoritative.nonce_hex,
                         )
 
                         if submit.accepted:
-                            self.on_log(f"[submit] accepted nonce={candidate.nonce_hex}")
+                            self.on_log(f"[submit] accepted nonce={authoritative.nonce_hex}")
                         else:
                             self.on_log(
-                                f"[submit] rejected nonce={candidate.nonce_hex} "
+                                f"[submit] rejected nonce={authoritative.nonce_hex} "
                                 f"status={submit.status} error={submit.error}"
                             )
 

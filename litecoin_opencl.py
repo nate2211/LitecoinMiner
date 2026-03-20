@@ -14,7 +14,6 @@ except Exception:
 
 from litecoin_models import LitecoinCandidateShare, LitecoinMinerConfig, LitecoinPreparedWork
 from litecoin_native import LitecoinNativeBridge
-from litecoin_utils import bytes_to_hex0x
 
 
 @dataclass
@@ -111,7 +110,7 @@ class OpenCLLitecoinScanner:
     ) -> None:
         self.config = config
         self.on_log = on_log
-        self.native = native
+        self.native = native  # optional, not required by scanner itself
 
         self.ctx = None
         self.queue = None
@@ -144,8 +143,6 @@ class OpenCLLitecoinScanner:
     def initialize(self) -> None:
         if cl is None:
             raise RuntimeError("pyopencl is not installed")
-        if self.native is None or not self.native.available:
-            raise RuntimeError("OpenCL scanner requires LitecoinProject.dll for verification")
 
         kernel_path = _resolve_existing_path(
             getattr(self.config, "kernel_path", "") or "",
@@ -270,8 +267,6 @@ class OpenCLLitecoinScanner:
             raise RuntimeError("pyopencl is not installed")
         if self.ctx is None or self.queue is None or self.kernel is None:
             raise RuntimeError("OpenCL scanner has not been initialized")
-        if self.native is None or not self.native.available:
-            raise RuntimeError("Native verifier is not available")
 
         count = max(1, int(count))
         max_results = max(
@@ -345,27 +340,13 @@ class OpenCLLitecoinScanner:
             if len(hash_le) != 32:
                 continue
 
-            header80 = work.header76 + nonce.to_bytes(4, "little", signed=False)
-            verify_hash = self.native.scrypt_hash(header80)
-
-            if verify_hash != hash_le:
-                self.on_log(
-                    f"[opencl] dropping mismatched candidate nonce={nonce:08x} "
-                    f"gpu_hash={bytes_to_hex0x(hash_le[::-1])} "
-                    f"cpu_hash={bytes_to_hex0x(verify_hash[::-1])}"
-                )
-                continue
-
-            if not self.native.hash_meets_target(verify_hash, work.share_target32_le):
-                continue
-
             results.append(
                 LitecoinCandidateShare(
                     job_id=work.job_id,
                     extranonce2_hex=work.extranonce2_hex,
                     ntime_hex=work.ntime_hex,
                     nonce_hex=f"{nonce:08x}",
-                    hash_hex=verify_hash[::-1].hex(),
+                    hash_hex=hash_le[::-1].hex(),
                     backend="opencl",
                 )
             )

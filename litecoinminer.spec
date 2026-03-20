@@ -4,25 +4,27 @@
 
 import os
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
 ROOT = Path(globals().get("SPECPATH", os.getcwd())).resolve()
 
-def add_data(filename, dest="."):
+def add_data(filename: str, dest: str = "."):
     p = ROOT / filename
     if p.exists():
         return [(str(p), dest)]
     print(f"[spec] warning: missing data file: {p}")
     return []
 
-def add_binary(filename, dest="."):
+def add_binary(filename: str, dest: str = "."):
     p = ROOT / filename
     if p.exists():
         return [(str(p), dest)]
     print(f"[spec] warning: missing binary file: {p}")
     return []
+
+# Prefer main.py if it exists; otherwise fall back to gui.py.
+ENTRY = "gui.py"
 
 datas = []
 datas += add_data("litecoin_miner_config.json")
@@ -30,10 +32,13 @@ datas += add_data("litecoin_scrypt_scan.cl")
 
 binaries = []
 binaries += add_binary("LitecoinProject.dll")
-binaries += add_binary("OpenCL.dll")
+
+# Usually do NOT bundle OpenCL.dll.
+# Let the system/vendor OpenCL loader provide it unless you truly need a private one.
+# binaries += add_binary("OpenCL.dll")
 
 hiddenimports = [
-    "litecoin_models",   # keep this if your file is really named litecoin_modeles.py
+    "litecoin_models",
     "litecoin_native",
     "litecoin_opencl",
     "litecoin_pool",
@@ -41,14 +46,8 @@ hiddenimports = [
     "litecoin_worker",
 ]
 
-# If the real filename is litecoin_models.py instead, replace the line above with:
-# "litecoin_models",
-
-# Helps PyInstaller catch PyQt5 pieces if your GUI imports are dynamic.
-hiddenimports += collect_submodules("PyQt5")
-
 a = Analysis(
-    ["gui.py"],
+    [ENTRY],
     pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,
@@ -72,10 +71,10 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,   # change to True if you want a console window
+    console=False,   # keep True until startup works
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
