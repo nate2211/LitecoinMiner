@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from typing import Callable, Optional
 
 from litecoin_models import LitecoinCandidateShare, LitecoinMinerConfig, LitecoinPreparedWork
@@ -12,24 +13,86 @@ U32_P = ctypes.POINTER(ctypes.c_uint32)
 INT_P = ctypes.POINTER(ctypes.c_int)
 
 
-def _module_dir() -> str:
-    return os.path.abspath(os.path.dirname(__file__))
+def _search_roots() -> list[str]:
+    roots: list[str] = []
+
+    try:
+        roots.append(os.path.abspath(os.path.dirname(__file__)))
+    except Exception:
+        pass
+
+    try:
+        roots.append(os.path.abspath(os.getcwd()))
+    except Exception:
+        pass
+
+    try:
+        roots.append(os.path.abspath(os.path.dirname(sys.executable)))
+    except Exception:
+        pass
+
+    try:
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(os.path.abspath(meipass))
+    except Exception:
+        pass
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        norm = os.path.normcase(os.path.abspath(root))
+        if norm not in seen:
+            seen.add(norm)
+            out.append(os.path.abspath(root))
+    return out
 
 
-def _resolve_path(path: str) -> str:
-    text = (path or "").strip()
-    if not text:
-        return os.path.join(_module_dir(), "LitecoinProject.dll")
-    if os.path.isabs(text):
-        return text
-    return os.path.abspath(os.path.join(_module_dir(), text))
+def _candidate_paths(path: str, default_name: str) -> list[str]:
+    raw = (path or "").strip()
+    roots = _search_roots()
+    candidates: list[str] = []
+
+    if raw:
+        if os.path.isabs(raw):
+            candidates.append(os.path.abspath(raw))
+            basename = os.path.basename(raw)
+            if basename:
+                for root in roots:
+                    candidates.append(os.path.abspath(os.path.join(root, basename)))
+        else:
+            for root in roots:
+                candidates.append(os.path.abspath(os.path.join(root, raw)))
+    else:
+        for root in roots:
+            candidates.append(os.path.abspath(os.path.join(root, default_name)))
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        norm = os.path.normcase(os.path.abspath(candidate))
+        if norm not in seen:
+            seen.add(norm)
+            out.append(os.path.abspath(candidate))
+    return out
+
+
+def _resolve_existing_path(path: str, default_name: str) -> str:
+    candidates = _candidate_paths(path, default_name)
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    tried = "\n  ".join(candidates)
+    raise FileNotFoundError(
+        f"Could not locate {default_name!r}. Tried:\n  {tried}"
+    )
 
 
 class LitecoinNativeBridge:
     def __init__(self, dll_path: str, on_log: Optional[Callable[[str], None]] = None) -> None:
-        self.dll_path = _resolve_path(dll_path)
         self.on_log = on_log or (lambda msg: None)
 
+        self.dll_path = ""
         self.lib = None
         self.available = False
         self.load_error = ""
@@ -42,11 +105,8 @@ class LitecoinNativeBridge:
         self._fn_last_error_message = None
 
         try:
-            if os.name == "nt":
-                dll_dir = os.path.dirname(self.dll_path)
-                if dll_dir and hasattr(os, "add_dll_directory"):
-                    self._dll_dir_handles.append(os.add_dll_directory(dll_dir))
-
+            self.dll_path = _resolve_existing_path(dll_path, "LitecoinProject.dll")
+            self._prepare_dll_search_dirs(self.dll_path)
             self.lib = ctypes.CDLL(self.dll_path)
             self._bind_functions()
 
@@ -76,6 +136,32 @@ class LitecoinNativeBridge:
             self.available = False
             self.load_error = str(exc)
             self.on_log(f"[native] unavailable: {exc}")
+
+    def _prepare_dll_search_dirs(self, dll_path: str) -> None:
+        if os.name != "nt":
+            return
+
+        dirs: list[str] = []
+        dll_dir = os.path.abspath(os.path.dirname(dll_path))
+        dirs.append(dll_dir)
+
+        for root in _search_roots():
+            dirs.append(os.path.abspath(root))
+
+        seen: set[str] = set()
+        for directory in dirs:
+            if not directory or not os.path.isdir(directory):
+                continue
+            norm = os.path.normcase(os.path.abspath(directory))
+            if norm in seen:
+                continue
+            seen.add(norm)
+
+            try:
+                if hasattr(os, "add_dll_directory"):
+                    self._dll_dir_handles.append(os.add_dll_directory(directory))
+            except Exception:
+                pass
 
     def _bind_optional(self, name: str, argtypes, restype):
         if self.lib is None:
@@ -147,11 +233,14 @@ class LitecoinNativeBridge:
     def scrypt_hash(self, header80: bytes) -> bytes:
         if self._fn_scrypt_hash is None:
             raise RuntimeError("ltc_scrypt_hash is not available")
+
         header_arr = self._u8_array(header80, 80)
         out_arr = (ctypes.c_ubyte * 32)()
+
         rc = self._fn_scrypt_hash(header_arr, out_arr)
         if rc != 0:
             raise RuntimeError(f"ltc_scrypt_hash failed: rc={rc}{self._dll_error_suffix()}")
+
         return bytes(out_arr)
 
     def scrypt_scan(
@@ -190,6 +279,7 @@ class LitecoinNativeBridge:
     def hash_meets_target(self, hash32_le: bytes, target32_le: bytes) -> bool:
         if self._fn_hash_meets_target is None:
             raise RuntimeError("ltc_hash_meets_target is not available")
+
         hash_arr = self._u8_array(hash32_le, 32)
         tgt_arr = self._u8_array(target32_le, 32)
         rc = self._fn_hash_meets_target(hash_arr, tgt_arr)

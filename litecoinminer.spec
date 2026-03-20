@@ -33,7 +33,6 @@ binaries += add_binary("LitecoinProject.dll")
 binaries += add_binary("OpenCL.dll")
 
 hiddenimports = [
-    "gui",
     "litecoin_models",   # keep this if your file is really named litecoin_modeles.py
     "litecoin_native",
     "litecoin_opencl",
@@ -49,7 +48,7 @@ hiddenimports = [
 hiddenimports += collect_submodules("PyQt5")
 
 a = Analysis(
-    ["main.py"],
+    ["gui.py"],
     pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,

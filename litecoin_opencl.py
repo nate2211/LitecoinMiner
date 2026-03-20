@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -24,10 +25,79 @@ class OpenCLDeviceInfo:
     device_name: str
 
 
-def _resolve_path(path: str) -> str:
-    if os.path.isabs(path):
-        return path
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), path))
+def _search_roots() -> list[str]:
+    roots: list[str] = []
+
+    try:
+        roots.append(os.path.abspath(os.path.dirname(__file__)))
+    except Exception:
+        pass
+
+    try:
+        roots.append(os.path.abspath(os.getcwd()))
+    except Exception:
+        pass
+
+    try:
+        roots.append(os.path.abspath(os.path.dirname(sys.executable)))
+    except Exception:
+        pass
+
+    try:
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(os.path.abspath(meipass))
+    except Exception:
+        pass
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        norm = os.path.normcase(os.path.abspath(root))
+        if norm not in seen:
+            seen.add(norm)
+            out.append(os.path.abspath(root))
+    return out
+
+
+def _candidate_paths(path: str, default_name: str) -> list[str]:
+    raw = (path or "").strip()
+    roots = _search_roots()
+    candidates: list[str] = []
+
+    if raw:
+        if os.path.isabs(raw):
+            candidates.append(os.path.abspath(raw))
+            basename = os.path.basename(raw)
+            if basename:
+                for root in roots:
+                    candidates.append(os.path.abspath(os.path.join(root, basename)))
+        else:
+            for root in roots:
+                candidates.append(os.path.abspath(os.path.join(root, raw)))
+    else:
+        for root in roots:
+            candidates.append(os.path.abspath(os.path.join(root, default_name)))
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        norm = os.path.normcase(os.path.abspath(candidate))
+        if norm not in seen:
+            seen.add(norm)
+            out.append(os.path.abspath(candidate))
+    return out
+
+
+def _resolve_existing_path(path: str, default_name: str) -> str:
+    candidates = _candidate_paths(path, default_name)
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    tried = "\n  ".join(candidates)
+    raise FileNotFoundError(
+        f"Could not locate {default_name!r}. Tried:\n  {tried}"
+    )
 
 
 class OpenCLLitecoinScanner:
@@ -49,6 +119,9 @@ class OpenCLLitecoinScanner:
         self.device = None
         self.kernel = None
         self._lws: Optional[int] = None
+
+        self._scratch_buf = None
+        self._scratch_buf_nbytes = 0
 
     @staticmethod
     def list_devices() -> list[OpenCLDeviceInfo]:
@@ -74,9 +147,11 @@ class OpenCLLitecoinScanner:
         if self.native is None or not self.native.available:
             raise RuntimeError("OpenCL scanner requires LitecoinProject.dll for verification")
 
-        kernel_path = _resolve_path(self.config.kernel_path)
-        if not os.path.exists(kernel_path):
-            raise RuntimeError(f"OpenCL kernel file not found: {kernel_path}")
+        kernel_path = _resolve_existing_path(
+            getattr(self.config, "kernel_path", "") or "",
+            "litecoin_scrypt_scan.cl",
+        )
+        self.on_log(f"[opencl] kernel_path={kernel_path}")
 
         with open(kernel_path, "r", encoding="utf-8") as fh:
             src = fh.read()
@@ -102,7 +177,7 @@ class OpenCLLitecoinScanner:
         self.ctx = cl.Context(devices=[self.device])
         self.queue = cl.CommandQueue(self.ctx, self.device)
 
-        build_options = str(self.config.build_options or "").strip()
+        build_options = str(getattr(self.config, "build_options", "") or "").strip()
         program = None
         try:
             program = cl.Program(self.ctx, src)
@@ -122,7 +197,10 @@ class OpenCLLitecoinScanner:
                 self.on_log("[opencl] build log:\n" + "\n\n".join(build_log_parts))
             raise RuntimeError(f"OpenCL build failed: {exc}") from exc
 
-        kernel_name = self.config.opencl_kernel_name
+        kernel_name = str(getattr(self.config, "opencl_kernel_name", "") or "").strip()
+        if not kernel_name:
+            raise RuntimeError("config.opencl_kernel_name is empty")
+
         try:
             self.kernel = cl.Kernel(self.program, kernel_name)
         except Exception as exc:
@@ -138,7 +216,7 @@ class OpenCLLitecoinScanner:
         )
 
     def _choose_local_work_size(self, kernel, kernel_name: str) -> int:
-        requested = int(self.config.local_work_size)
+        requested = int(getattr(self.config, "local_work_size", 1))
 
         kernel_max = 1
         preferred_multiple = 1
@@ -196,7 +274,14 @@ class OpenCLLitecoinScanner:
             raise RuntimeError("Native verifier is not available")
 
         count = max(1, int(count))
-        max_results = max(1, int(max_results if max_results is not None else self.config.max_results_per_scan))
+        max_results = max(
+            1,
+            int(
+                max_results
+                if max_results is not None
+                else getattr(self.config, "max_results_per_scan", 1)
+            ),
+        )
 
         mf = cl.mem_flags
 
@@ -209,7 +294,6 @@ class OpenCLLitecoinScanner:
 
         header76_buf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=header76_arr)
         target_buf = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=target_arr)
-
         out_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=out_count)
         out_nonces_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=out_nonces)
         out_hashes_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=out_hashes)
@@ -217,18 +301,17 @@ class OpenCLLitecoinScanner:
         lws = int(self._lws or 1)
         gws = self._round_up(count, lws)
 
-        # inside OpenCLLitecoinScanner.scan(...)
-
         scratch_words_per_item = 1024 * 32  # SCRYPT_V_WORDS
-        lws = int(self._lws or 1)
-        gws = self._round_up(count, lws)
-
         required_words = gws * scratch_words_per_item
         required_bytes = required_words * 4
 
-        if getattr(self, "_scratch_buf_nbytes", 0) < required_bytes:
-            self._scratch_buf = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, required_bytes)
+        if self._scratch_buf is None or self._scratch_buf_nbytes < required_bytes:
+            self._scratch_buf = cl.Buffer(self.ctx, mf.READ_WRITE, required_bytes)
             self._scratch_buf_nbytes = required_bytes
+            self.on_log(
+                f"[opencl] allocated scratch buffer size={required_bytes} bytes "
+                f"gws={gws} lws={lws}"
+            )
 
         evt = self.kernel(
             self.queue,
@@ -239,7 +322,7 @@ class OpenCLLitecoinScanner:
             np.uint32(int(start_nonce) & 0xFFFFFFFF),
             np.uint32(count),
             np.uint32(max_results),
-            self._scratch_buf,  # NEW
+            self._scratch_buf,
             out_count_buf,
             out_nonces_buf,
             out_hashes_buf,
@@ -264,10 +347,12 @@ class OpenCLLitecoinScanner:
 
             header80 = work.header76 + nonce.to_bytes(4, "little", signed=False)
             verify_hash = self.native.scrypt_hash(header80)
+
             if verify_hash != hash_le:
                 self.on_log(
                     f"[opencl] dropping mismatched candidate nonce={nonce:08x} "
-                    f"gpu_hash={bytes_to_hex0x(hash_le[::-1])} cpu_hash={bytes_to_hex0x(verify_hash[::-1])}"
+                    f"gpu_hash={bytes_to_hex0x(hash_le[::-1])} "
+                    f"cpu_hash={bytes_to_hex0x(verify_hash[::-1])}"
                 )
                 continue
 
@@ -288,6 +373,8 @@ class OpenCLLitecoinScanner:
         return results
 
     def close(self) -> None:
+        self._scratch_buf = None
+        self._scratch_buf_nbytes = 0
         self.kernel = None
         self.program = None
         self.queue = None
