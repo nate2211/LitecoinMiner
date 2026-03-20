@@ -8,11 +8,16 @@
 #define SCRYPT_N                    1024u
 #define SCRYPT_R                    1u
 #define SCRYPT_P                    1u
-#define SCRYPT_BLOCK_BYTES          (128u * SCRYPT_R)          // 128
-#define SCRYPT_BLOCK_WORDS          (SCRYPT_BLOCK_BYTES / 4u)  // 32
+#define SCRYPT_BLOCK_BYTES          (128u * SCRYPT_R)              // 128
+#define SCRYPT_BLOCK_WORDS          (SCRYPT_BLOCK_BYTES / 4u)      // 32
 #define SCRYPT_V_WORDS              (SCRYPT_N * SCRYPT_BLOCK_WORDS) // 32768
+
 #define PBKDF2_MAX_SALT_BYTES       128u
 #define PBKDF2_MAX_MSG_BYTES        (PBKDF2_MAX_SALT_BYTES + 4u)
+
+#ifndef LTC_HASHES_PER_THREAD
+#define LTC_HASHES_PER_THREAD       1u
+#endif
 
 inline uint rotl32(uint x, uint n) { return (x << n) | (x >> (32u - n)); }
 inline uint rotr32(uint x, uint n) { return (x >> n) | (x << (32u - n)); }
@@ -90,7 +95,7 @@ inline void sha256_init(sha256_ctx* ctx)
     ctx->h[7] = 0x5be0cd19u;
     ctx->total_len = 0ul;
     ctx->buf_len = 0u;
-    for (int i = 0; i < 64; ++i) ctx->buf[i] = 0;
+    for (int i = 0; i < 64; ++i) ctx->buf[i] = 0u;
 }
 
 inline void sha256_transform(sha256_ctx* ctx, const uchar block[64])
@@ -149,15 +154,36 @@ inline void sha256_update(sha256_ctx* ctx, const uchar* data, uint len)
 {
     ctx->total_len += (ulong)len;
 
-    for (uint i = 0; i < len; ++i)
+    uint offset = 0u;
+
+    if (ctx->buf_len != 0u)
     {
-        ctx->buf[ctx->buf_len++] = data[i];
+        uint take = 64u - ctx->buf_len;
+        if (take > len) take = len;
+
+        for (uint i = 0u; i < take; ++i)
+            ctx->buf[ctx->buf_len + i] = data[i];
+
+        ctx->buf_len += take;
+        offset += take;
+
         if (ctx->buf_len == 64u)
         {
             sha256_transform(ctx, ctx->buf);
             ctx->buf_len = 0u;
         }
     }
+
+    while ((len - offset) >= 64u)
+    {
+        sha256_transform(ctx, data + offset);
+        offset += 64u;
+    }
+
+    for (uint i = 0u; i < (len - offset); ++i)
+        ctx->buf[i] = data[offset + i];
+
+    ctx->buf_len = len - offset;
 }
 
 inline void sha256_final(sha256_ctx* ctx, uchar out32[32])
@@ -211,7 +237,7 @@ inline void hmac_sha256_key_setup(
     uchar key_block[64];
     uchar key_hash[32];
 
-    for (int i = 0; i < 64; ++i) key_block[i] = 0;
+    for (int i = 0; i < 64; ++i) key_block[i] = 0u;
 
     if (key_len > 64u)
     {
@@ -220,11 +246,12 @@ inline void hmac_sha256_key_setup(
     }
     else
     {
-        for (uint i = 0; i < key_len; ++i) key_block[i] = key[i];
+        for (uint i = 0u; i < key_len; ++i) key_block[i] = key[i];
     }
 
     uchar ipad[64];
     uchar opad[64];
+
     for (int i = 0; i < 64; ++i)
     {
         ipad[i] = (uchar)(key_block[i] ^ 0x36u);
@@ -272,7 +299,7 @@ inline void pbkdf2_hmac_sha256_c1(
 
     for (uint block = 1u; block <= blocks; ++block)
     {
-        for (uint i = 0; i < salt_len; ++i)
+        for (uint i = 0u; i < salt_len; ++i)
             msg[i] = salt[i];
 
         msg[salt_len + 0u] = (uchar)((block >> 24) & 0xffu);
@@ -326,7 +353,6 @@ inline void blockmix_salsa8_r1(const uint inB[SCRYPT_BLOCK_WORDS], uint outB[SCR
     for (int i = 0; i < 16; ++i)
         X[i] = inB[16 + i];
 
-    // i = 0
     for (int i = 0; i < 16; ++i)
         T[i] = X[i] ^ inB[i];
     salsa20_8(T);
@@ -336,20 +362,15 @@ inline void blockmix_salsa8_r1(const uint inB[SCRYPT_BLOCK_WORDS], uint outB[SCR
         X[i] = T[i];
     }
 
-    // i = 1
     for (int i = 0; i < 16; ++i)
         T[i] = X[i] ^ inB[16 + i];
     salsa20_8(T);
     for (int i = 0; i < 16; ++i)
         outB[16 + i] = T[i];
-
-    // For r=1, output ordering Y0 || Y1 is already correct.
 }
 
 inline uint integerify_mod_n_r1(const uint B[SCRYPT_BLOCK_WORDS])
 {
-    // For r=1, Integerify looks at the first 8 bytes of the last 64-byte chunk.
-    // Because N=1024 is a power of two, we only need the low 10 bits.
     return B[16] & (SCRYPT_N - 1u);
 }
 
@@ -378,7 +399,6 @@ inline void scrypt_1024_1_1_hash_le(
     for (int i = 0; i < (int)SCRYPT_BLOCK_WORDS; ++i)
         X[i] = load_le32(B0_bytes + (i * 4));
 
-    // ROMix
     for (uint i = 0u; i < SCRYPT_N; ++i)
     {
         uint base = i * SCRYPT_BLOCK_WORDS;
@@ -386,6 +406,7 @@ inline void scrypt_1024_1_1_hash_le(
             scratch_v_words[base + k] = X[k];
 
         blockmix_salsa8_r1(X, Y);
+
         for (uint k = 0u; k < SCRYPT_BLOCK_WORDS; ++k)
             X[k] = Y[k];
     }
@@ -399,6 +420,7 @@ inline void scrypt_1024_1_1_hash_le(
             T[k] = X[k] ^ scratch_v_words[base + k];
 
         blockmix_salsa8_r1(T, Y);
+
         for (uint k = 0u; k < SCRYPT_BLOCK_WORDS; ++k)
             X[k] = Y[k];
     }
@@ -409,7 +431,6 @@ inline void scrypt_1024_1_1_hash_le(
     // PBKDF2-HMAC-SHA256(P=header80, S=Bf, c=1, dkLen=32)
     pbkdf2_hmac_sha256_c1(&ipad_base, &opad_base, Bf_bytes, 128u, 1u, digest_be);
 
-    // Match the existing host-side "hash32_le" convention.
     for (int i = 0; i < 32; ++i)
         out32_le[i] = digest_be[31 - i];
 }
@@ -421,8 +442,8 @@ inline int hash_meets_target_le32(
 {
     for (int i = 31; i >= 0; --i)
     {
-        const uchar h = hash32_le[i];
-        const uchar t = target32_le[i];
+        uchar h = hash32_le[i];
+        uchar t = target32_le[i];
         if (h < t) return 1;
         if (h > t) return 0;
     }
@@ -435,42 +456,51 @@ __kernel void ltc_scrypt_scan(
     const uint start_nonce,
     const uint count,
     const uint max_results,
-    __global uint* scratch_words,   // NEW: gws * SCRYPT_V_WORDS uints
+    __global uint* scratch_words,
     __global uint* out_count,
     __global uint* out_nonces,
     __global uchar* out_hashes
 )
 {
     const uint gid = (uint)get_global_id(0);
-    if (gid >= count)
-        return;
+    const uint gsz = (uint)get_global_size(0);
 
-    const uint nonce = start_nonce + gid;
+    if (gid >= count && LTC_HASHES_PER_THREAD == 1u)
+        return;
 
     uchar header80[80];
     for (int i = 0; i < 76; ++i)
         header80[i] = header76[i];
 
-    header80[76] = (uchar)( nonce        & 0xffu);
-    header80[77] = (uchar)((nonce >> 8)  & 0xffu);
-    header80[78] = (uchar)((nonce >> 16) & 0xffu);
-    header80[79] = (uchar)((nonce >> 24) & 0xffu);
-
     __global uint* my_scratch = scratch_words + ((size_t)gid * (size_t)SCRYPT_V_WORDS);
 
-    uchar hash32_le[32];
-    scrypt_1024_1_1_hash_le(header80, my_scratch, hash32_le);
+    for (uint iter = 0u; iter < LTC_HASHES_PER_THREAD; ++iter)
+    {
+        uint logical_index = gid + iter * gsz;
+        if (logical_index >= count)
+            break;
 
-    if (!hash_meets_target_le32(hash32_le, target32_le))
-        return;
+        uint nonce = start_nonce + logical_index;
 
-    const uint slot = atomic_inc((volatile __global uint*)out_count);
-    if (slot >= max_results)
-        return;
+        header80[76] = (uchar)( nonce        & 0xffu);
+        header80[77] = (uchar)((nonce >> 8)  & 0xffu);
+        header80[78] = (uchar)((nonce >> 16) & 0xffu);
+        header80[79] = (uchar)((nonce >> 24) & 0xffu);
 
-    out_nonces[slot] = nonce;
+        uchar hash32_le[32];
+        scrypt_1024_1_1_hash_le(header80, my_scratch, hash32_le);
 
-    const uint hash_base = slot * LTC_HASH_BYTES;
-    for (int i = 0; i < 32; ++i)
-        out_hashes[hash_base + i] = hash32_le[i];
+        if (!hash_meets_target_le32(hash32_le, target32_le))
+            continue;
+
+        uint slot = atomic_inc((volatile __global uint*)out_count);
+        if (slot >= max_results)
+            continue;
+
+        out_nonces[slot] = nonce;
+
+        uint hash_base = slot * LTC_HASH_BYTES;
+        for (int i = 0; i < 32; ++i)
+            out_hashes[hash_base + (uint)i] = hash32_le[i];
+    }
 }

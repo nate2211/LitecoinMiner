@@ -3,11 +3,7 @@ from __future__ import annotations
 import time
 from typing import Callable, Optional
 
-from litecoin_models import (
-    LitecoinJob,
-    LitecoinMinerConfig,
-    LitecoinPreparedWork,
-)
+from litecoin_models import LitecoinJob, LitecoinMinerConfig, LitecoinPreparedWork
 from litecoin_native import LitecoinNativeBridge, NativeLitecoinScanner
 from litecoin_pool import LitecoinStratumClient
 from litecoin_utils import (
@@ -37,7 +33,7 @@ class LitecoinMinerWorker:
         self._stop = True
 
     def _create_scanner(self, native: LitecoinNativeBridge):
-        backend = self.config.scan_backend
+        backend = str(self.config.scan_backend or "native").strip().lower()
         if backend == "opencl":
             from litecoin_opencl import OpenCLLitecoinScanner
             return OpenCLLitecoinScanner(
@@ -99,7 +95,14 @@ class LitecoinMinerWorker:
         )
         return prepared
 
+    def _sleep_stop_aware(self, seconds: float) -> None:
+        end_at = time.monotonic() + max(0.0, float(seconds))
+        while not self._stop and time.monotonic() < end_at:
+            time.sleep(min(0.1, max(0.0, end_at - time.monotonic())))
+
     def run(self) -> None:
+        reconnect_delay = max(0.1, float(self.config.reconnect_delay_s))
+
         while not self._stop:
             pool: Optional[LitecoinStratumClient] = None
             native: Optional[LitecoinNativeBridge] = None
@@ -131,6 +134,9 @@ class LitecoinMinerWorker:
                 scanned_since_rate = 0
 
                 while not self._stop:
+                    if not pool.alive:
+                        raise ConnectionError(pool.reader_error or "pool reader stopped")
+
                     newest = pool.wait_for_job(timeout=self.config.idle_sleep_s)
                     if newest is not None and (
                         current_job is None or newest.received_at != current_job.received_at
@@ -140,12 +146,24 @@ class LitecoinMinerWorker:
                         extranonce2_counter += 1
                         start_nonce = 0
 
-                    if current_job is None or prepared is None:
-                        continue
+                    if current_job is None:
+                        latest = pool.get_latest_job()
+                        if latest is not None:
+                            current_job = latest
+                            prepared = self._prepare_work(current_job, extranonce2_counter)
+                            extranonce2_counter += 1
+                            start_nonce = 0
+                        else:
+                            continue
 
                     latest = pool.get_latest_job()
                     if latest is not None and latest.received_at != current_job.received_at:
                         current_job = latest
+                        prepared = self._prepare_work(current_job, extranonce2_counter)
+                        extranonce2_counter += 1
+                        start_nonce = 0
+
+                    if prepared is None:
                         prepared = self._prepare_work(current_job, extranonce2_counter)
                         extranonce2_counter += 1
                         start_nonce = 0
@@ -186,7 +204,16 @@ class LitecoinMinerWorker:
                         scanned_since_rate = 0
                         last_rate_at = now
 
+                    if not pool.alive:
+                        raise ConnectionError(pool.reader_error or "pool reader stopped")
+
                     for candidate in candidates:
+                        if self._stop:
+                            break
+
+                        if not pool.alive:
+                            raise ConnectionError(pool.reader_error or "pool reader stopped")
+
                         self.on_log(
                             f"[share] found job={candidate.job_id} nonce={candidate.nonce_hex} "
                             f"hash=0x{candidate.hash_hex} backend={candidate.backend}"
@@ -222,7 +249,8 @@ class LitecoinMinerWorker:
                 self.on_status("reconnecting")
                 if self._stop:
                     break
-                time.sleep(self.config.reconnect_delay_s)
+                self._sleep_stop_aware(reconnect_delay)
+
             finally:
                 try:
                     if scanner is not None:
